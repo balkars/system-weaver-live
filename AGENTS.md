@@ -8,3 +8,5 @@
 > Commits you push to the connected branch sync back to Lovable and show up in
 > the editor, so keep the branch in a working state.
 <!-- LOVABLE:END -->
+
+- The system model (src/lib/model) is the source of truth; every canvas view is derived from it, and only HLD (root) / LLD (inside a component) are editable.
