@@ -113,3 +113,35 @@ export function download(filename: string, content: string, type = "text/plain")
   a.click();
   URL.revokeObjectURL(url);
 }
+
+/** Lucidchart "Export → CSV of shape data". */
+export function parseLucidCsv(csv: string): Graph {
+  const rows = csv.split(/\r?\n/).filter(Boolean).map((line) => {
+    const out: string[] = [];
+    let cur = "";
+    let q = false;
+    for (const ch of line) {
+      if (ch === '"') q = !q;
+      else if (ch === "," && !q) {
+        out.push(cur);
+        cur = "";
+      } else cur += ch;
+    }
+    out.push(cur);
+    return out;
+  });
+  const [head, ...body] = rows;
+  const col = (n: string) => head.findIndex((h) => h.trim().toLowerCase() === n);
+  const iId = col("id"), iText = col("text area 1"), iSrc = col("line source"), iDst = col("line destination");
+  const map = new Map<string, SysNode>();
+  body.forEach((r) => {
+    if (r[iSrc] || r[iDst] || !r[iText]) return;
+    map.set(r[iId], makeNode(inferKind(r[iText]), r[iText].trim()));
+  });
+  const edges = body.flatMap((r) => {
+    const s = map.get(r[iSrc]);
+    const t = map.get(r[iDst]);
+    return s && t ? [makeEdge(s.id, t.id, r[iText] ? { protocol: r[iText] } : {})] : [];
+  });
+  return autoLayout({ nodes: [...map.values()], edges });
+}
