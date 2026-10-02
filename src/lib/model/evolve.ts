@@ -31,7 +31,11 @@ function insertBetween(g: Graph, from: (n: SysNode) => boolean, to: (n: SysNode)
   const tgts = [...new Set(matching.map((e) => e.target))];
   return {
     nodes: [...g.nodes, mid],
-    edges: [...keep, ...srcs.map((s) => makeEdge(s, mid.id)), ...tgts.map((t) => makeEdge(mid.id, t, { ...matching[0], ...edgeExtra, id: undefined as never, source: mid.id, target: t }))].map((e) => (e.id ? e : { ...e, id: makeEdge("a", "b").id })),
+    edges: [
+      ...keep,
+      ...srcs.map((s) => makeEdge(s, mid.id, { protocol: matching[0].protocol })),
+      ...tgts.map((t) => makeEdge(mid.id, t, { protocol: matching[0].protocol, pattern: matching[0].pattern, latency: matching[0].latency, ...edgeExtra })),
+    ],
   };
 }
 
