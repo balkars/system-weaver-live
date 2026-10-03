@@ -51,6 +51,10 @@ function cloneNode(g: Graph, pred: (n: SysNode) => boolean, rename: (n: string) 
   return { nodes: [...g.nodes, copy], edges: [...g.edges, ...edges] };
 }
 
+function setUsers(g: Graph, v: string): Graph {
+  return { ...g, nodes: g.nodes.map((n) => (n.kind === "user" ? { ...n, fields: { ...n.fields, Concurrent: v } } : n)) };
+}
+
 const has = (g: Graph, kind: string) => g.nodes.some((n) => n.kind === kind);
 
 export interface Requirement {
@@ -65,21 +69,15 @@ export interface Requirement {
 export const REQUIREMENTS: Requirement[] = [
   {
     id: "10k",
-    title: "10,000 concurrent users",
-    prompt: "Traffic grew 100x. One frontend instance is saturating.",
-    why: "A load balancer spreads requests across multiple frontend instances and removes the single-instance bottleneck.",
-    tradeoff: "The LB itself becomes a critical hop; you now need health checks and stateless instances.",
-    apply: (g) => {
-      g = insertBetween(g, (n) => n.kind === "user", (n) => n.kind === "frontend", () => makeNode("lb", "Load Balancer"));
-      g = cloneNode(g, (n) => n.kind === "frontend", (s) => `${s} #2`);
-      const u = g.nodes.find((n) => n.kind === "user");
-      if (u) u.fields = { ...u.fields, Concurrent: "10,000" };
-      return g;
-    },
+    title: "10K users",
+    prompt: "Traffic grew 100x overnight. Watch what breaks, then fix it.",
+    why: "Nothing is added for you. Look at the live metrics: the first component over 100% is your bottleneck.",
+    tradeoff: "Senior path: scale up first, then scale out behind a load balancer, then cache, replicate, shard.",
+    apply: (g) => setUsers(g, "10,000"),
   },
   {
     id: "auth",
-    title: "Users must stay logged in",
+    title: "Login & sessions",
     prompt: "Agents and customers need sessions and role-based access.",
     why: "A dedicated Auth Service issues JWTs and refresh tokens so every request is verified before reaching business logic.",
     tradeoff: "Auth is now on the hot path: if it fails, nobody can log in.",
@@ -90,22 +88,15 @@ export const REQUIREMENTS: Requirement[] = [
   },
   {
     id: "1m",
-    title: "Support 1 million users",
-    prompt: "Global audience, read-heavy ticket lists, bursts during incidents.",
-    why: "CDN/WAF absorbs static and malicious traffic, a second API server scales horizontally and Redis takes reads off the database.",
-    tradeoff: "Cache invalidation and stale reads become real problems. Redis is a new failure mode.",
-    apply: (g) => {
-      if (!has(g, "cdn")) g = insertBetween(g, (n) => n.kind === "user", (n) => n.kind === "lb" || n.kind === "frontend", () => makeNode("cdn", "CDN / WAF"));
-      g = g.nodes.filter((n) => n.kind === "backend").length < 2 ? cloneNode(g, (n) => n.kind === "backend", (s) => `${s} #2`) : g;
-      if (!has(g, "redis")) g = insertBetween(g, isApp, isDb, () => makeNode("redis", "Redis", { purpose: "Cache" }), { protocol: "SQL", latency: "5 ms" });
-      const u = g.nodes.find((n) => n.kind === "user");
-      if (u) u.fields = { ...u.fields, Concurrent: "1,000,000" };
-      return g;
-    },
+    title: "1M users",
+    prompt: "Global audience, read-heavy. Everything you fixed for 10K breaks again.",
+    why: "At this scale vertical scaling runs out; you need horizontal scale, caching and eventually sharding.",
+    tradeoff: "Each fix adds cost and a new failure mode.",
+    apply: (g) => setUsers(g, "1,000,000"),
   },
   {
     id: "async",
-    title: "Ticket creation must be asynchronous",
+    title: "Async tickets",
     prompt: "Ticket creation fans out to SLA timers, search indexing and routing. Requests time out.",
     why: "A queue decouples accepting a ticket from processing it. A worker consumes jobs at its own pace.",
     tradeoff: "Eventual consistency: a ticket may not appear instantly. You need idempotency and a DLQ.",
@@ -129,7 +120,7 @@ export const REQUIREMENTS: Requirement[] = [
   },
   {
     id: "dr",
-    title: "Survive a database failure",
+    title: "DB failover",
     prompt: "A single primary went down for 40 minutes last quarter.",
     why: "A streaming read replica can be promoted on failover and serves read traffic in the meantime.",
     tradeoff: "Replication lag; writes still need the primary until promotion completes.",
@@ -144,7 +135,7 @@ export const REQUIREMENTS: Requirement[] = [
   },
   {
     id: "notify",
-    title: "Email notifications",
+    title: "Email alerts",
     prompt: "Customers must be emailed when ticket status changes.",
     why: "A Notification Service consumes events from a queue so email slowness never blocks ticket updates.",
     tradeoff: "Duplicate emails on retry unless the consumer is idempotent.",
@@ -169,7 +160,7 @@ export const REQUIREMENTS: Requirement[] = [
   },
   {
     id: "observe",
-    title: "On-call needs visibility",
+    title: "Observability",
     prompt: "Incidents take hours to diagnose.",
     why: "Logs, metrics and traces from every service give on-call a timeline of what failed and where.",
     tradeoff: "Telemetry cost grows with traffic; sample traces.",
@@ -192,7 +183,7 @@ export const REQUIREMENTS: Requirement[] = [
   },
   {
     id: "global",
-    title: "Deploy globally",
+    title: "Go global",
     prompt: "EU customers see 400 ms latency and need data residency.",
     why: "Latency-based DNS routes users to the closest region; each region runs the stack.",
     tradeoff: "Cross-region data consistency and doubled infrastructure cost.",

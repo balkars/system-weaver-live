@@ -176,7 +176,7 @@ function scaleOut(g: Graph, id: string): Graph {
 
 function addCache(g: Graph, dbId: string): Graph {
   const redis = makeNode("redis", "Redis", { purpose: "Cache" });
-  const callers = callersOf(g, dbId).filter((e) => g.nodes.find((n) => n.id === e.source)?.kind !== dbKinds.find(() => false));
+  const callers = callersOf(g, dbId);
   const srcs = [...new Set(callers.map((e) => e.source))];
   return {
     nodes: [...g.nodes, redis],
