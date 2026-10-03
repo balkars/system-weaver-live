@@ -10,6 +10,9 @@ export type CardData = {
   state?: "failed" | "impacted";
   drillable?: boolean;
   derived?: boolean;
+  load?: number;
+  status?: "idle" | "ok" | "hot" | "breaking";
+  rps?: number;
 };
 
 export function KindIcon({ kind, className }: { kind: string; className?: string }) {
@@ -30,6 +33,7 @@ export function SysNodeCard({ data, selected }: NodeProps & { data: CardData }) 
         data.state === "failed" && "border-destructive bg-destructive/15 [border-left-color:var(--destructive)]",
         data.state === "impacted" && "border-warning/80 bg-warning/10",
         data.derived && "border-dashed",
+        data.status === "breaking" && !data.state && "border-destructive animate-pulse",
       )}
     >
       <Handle type="target" position={Position.Top} />
@@ -43,6 +47,14 @@ export function SysNodeCard({ data, selected }: NodeProps & { data: CardData }) 
         </div>
         {data.drillable && <Layers className="h-3.5 w-3.5 shrink-0 text-muted-foreground opacity-60 group-hover:opacity-100" />}
       </div>
+      {data.load !== undefined && data.status !== "idle" && (
+        <div className="mt-1.5 flex items-center gap-1.5">
+          <div className="h-1 flex-1 overflow-hidden rounded bg-secondary">
+            <div className="h-full" style={{ width: `${Math.min(100, data.load * 100)}%`, background: data.status === "breaking" ? "var(--destructive)" : data.status === "hot" ? "var(--warning)" : "var(--primary)" }} />
+          </div>
+          <span className="font-mono text-[9px] text-muted-foreground" style={data.status === "breaking" ? { color: "var(--destructive)" } : undefined}>{Math.round(data.load * 100)}%</span>
+        </div>
+      )}
       <Handle type="source" position={Position.Bottom} />
     </div>
   );

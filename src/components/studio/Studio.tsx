@@ -23,7 +23,8 @@ import { download, toDrawio, toMermaid } from "@/lib/model/io";
 import type { Graph, SysNode, SystemModel, ViewId } from "@/lib/model/types";
 import { VIEWS, deriveView, editableView } from "@/lib/model/views";
 import { cn } from "@/lib/utils";
-import { EdgeInspector, Evolve, Label, Library, NodeInspector, Review } from "./Panels";
+import { EdgeInspector, Evolve, Label, Library, NodeInspector, Review, Telemetry, UserSlider } from "./Panels";
+import { simulate, type Fix } from "@/lib/model/sim";
 import { ImportDialog } from "./ImportDialog";
 import { SysNodeCard, type CardData } from "./SysNodeCard";
 
@@ -63,6 +64,9 @@ function Canvas() {
   const updateScope = useCallback((fn: (g: Graph) => Graph) => setModel((m) => setGraph(m, path, fn)), [path]);
 
   const { failed, impacted } = useMemo(() => impactOf(scope), [scope]);
+  const sim = useMemo(() => simulate(scope), [scope]);
+  const userNode = scope.nodes.find((n) => n.kind === "user");
+  const applyFix = (f: Fix) => updateScope((g) => f.apply(structuredClone(g)));
 
   const base = useMemo(() => {
     if (editable) {
@@ -75,12 +79,16 @@ function Canvas() {
           kind: n.kind,
           sub: n.purpose,
           drillable: true,
+          load: sim.metrics.get(n.id)?.cap === Infinity ? undefined : sim.metrics.get(n.id)?.util,
+          status: sim.metrics.get(n.id)?.status,
+          rps: sim.metrics.get(n.id)?.rps,
           state: failed.has(n.id) ? "failed" : impacted.has(n.id) ? "impacted" : undefined,
         } satisfies CardData,
       }));
       const edges: Edge[] = scope.edges.map((e) => {
         const down = failed.has(e.target) || failed.has(e.source);
         const async = /async|telemetry|replication/i.test(e.pattern);
+        const hot = sim.metrics.get(e.target)?.status === "breaking";
         return {
           id: e.id,
           source: e.source,
@@ -88,7 +96,7 @@ function Canvas() {
           label: e.protocol,
           animated: !down && e.pattern !== "Relation",
           markerEnd: { type: MarkerType.ArrowClosed },
-          style: { strokeDasharray: async ? "5 4" : undefined, stroke: down ? "var(--destructive)" : undefined, opacity: e.pattern === "Telemetry" ? 0.4 : 1 },
+          style: { strokeDasharray: async ? "5 4" : undefined, stroke: down || hot ? "var(--destructive)" : undefined, opacity: e.pattern === "Telemetry" ? 0.4 : 1 },
         };
       });
       return { nodes, edges };
@@ -103,7 +111,7 @@ function Canvas() {
     }));
     const edges: Edge[] = d.edges.map((e, i) => ({ id: `d${i}`, source: e.source, target: e.target, label: e.label, animated: true, markerEnd: { type: MarkerType.ArrowClosed } }));
     return { nodes, edges };
-  }, [editable, scope, view, focus, parent, failed, impacted]);
+  }, [editable, scope, view, focus, parent, failed, impacted, sim]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
@@ -147,8 +155,29 @@ function Canvas() {
 
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
+    const req = e.dataTransfer.getData("application/x-sys-req");
+    if (req) {
+      if (path.length === 0 && !model.requirements.includes(req)) applyReq(req);
+      return;
+    }
     const kind = e.dataTransfer.getData("application/x-sys-kind");
     if (!kind) return;
+    // dropped onto an existing component: insert in front of it and rewire its callers
+    const hit = (document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null)?.closest(".react-flow__node")?.getAttribute("data-id");
+    const target = editable && hit ? scope.nodes.find((n) => n.id === hit) : undefined;
+    if (target) {
+      const n = makeNode(kind);
+      updateScope((g) => {
+        const callers = g.edges.filter((x) => x.target === target.id && !/telemetry|replication/i.test(x.pattern));
+        const srcs = [...new Set(callers.map((x) => x.source))];
+        return autoLayout({
+          nodes: [...g.nodes, n],
+          edges: [...g.edges.filter((x) => !callers.includes(x)), ...srcs.map((s) => makeEdge(s, n.id, { protocol: callers[0]?.protocol ?? "HTTPS" })), makeEdge(n.id, target.id, { protocol: callers[0]?.protocol ?? "HTTPS" })],
+        });
+      });
+      setSel({ type: "node", id: n.id });
+      return;
+    }
     if (!editable) setView(editableView(path.length));
     const pos = rf.screenToFlowPosition({ x: e.clientX - 95, y: e.clientY - 25 });
     const n = makeNode(kind, undefined, { x: pos.x, y: pos.y });
@@ -292,6 +321,15 @@ function Canvas() {
               <Controls showInteractive={false} />
               <MiniMap pannable zoomable maskColor="oklch(0.17 0.012 250 / 0.7)" style={{ background: "var(--card)" }} nodeColor={(n) => `var(--cat-${catalogOf((n.data as CardData).kind).category})`} />
             </ReactFlow>
+            {editable && userNode && (
+              <div className="absolute left-3 top-3 z-10 w-64 rounded-md border border-border bg-popover/95 p-2.5 shadow-xl backdrop-blur">
+                <div className="mb-1 flex items-center justify-between font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+                  <span>Traffic</span>
+                  <span style={{ color: sim.bottlenecks.length ? "var(--destructive)" : "var(--primary)" }}>{sim.bottlenecks.length ? `${sim.errorRate.toFixed(0)}% errors` : "healthy"}</span>
+                </div>
+                <UserSlider value={userNode.fields.Concurrent} onChange={(v) => updateScope((g) => ({ ...g, nodes: g.nodes.map((n) => (n.kind === "user" ? { ...n, fields: { ...n.fields, Concurrent: v } } : n)) }))} />
+              </div>
+            )}
             {editable && scope.nodes.length === 0 && (
               <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-muted-foreground">
                 Drag components here from the Components tab
@@ -314,6 +352,8 @@ function Canvas() {
                 setSel(null);
               }}
               onDrill={() => drill(selNode.id)}
+              metrics={sim.metrics.get(selNode.id)}
+              onFix={applyFix}
             />
           ) : selEdge ? (
             <EdgeInspector
@@ -329,6 +369,7 @@ function Canvas() {
           ) : (
             <>
               <Label>{focus ? `Inside ${focus.name}` : model.name}</Label>
+              {userNode && <div className="mb-5"><Telemetry sim={sim} graph={scope} onFix={applyFix} onSelect={(id) => setSel({ type: "node", id })} /></div>}
               <Review graph={scope} impacted={impacted.size} onRestoreAll={() => updateScope((g) => ({ ...g, nodes: g.nodes.map((n) => ({ ...n, failed: false })) }))} />
             </>
           )}
