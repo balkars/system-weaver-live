@@ -24,7 +24,10 @@ import type { Graph, SysNode, SystemModel, ViewId } from "@/lib/model/types";
 import { VIEWS, deriveView, editableView } from "@/lib/model/views";
 import { cn } from "@/lib/utils";
 import { EdgeInspector, Evolve, Label, Library, NodeInspector, Review, Telemetry, UserSlider } from "./Panels";
-import { simulate, type Fix } from "@/lib/model/sim";
+import { BASE_SCENARIO, simulate, type Fix, type Scenario } from "@/lib/model/sim";
+import { ArchitecturesPanel, ScenarioPanel, type Architecture } from "./SimLab";
+import { uid } from "@/lib/model/graph";
+import { FlaskConical } from "lucide-react";
 import { ImportDialog } from "./ImportDialog";
 import { SysNodeCard, type CardData } from "./SysNodeCard";
 
@@ -37,7 +40,9 @@ function Canvas() {
   const [path, setPath] = useState<string[]>([]);
   const [view, setView] = useState<ViewId>("hld");
   const [sel, setSel] = useState<Sel>(null);
-  const [leftTab, setLeftTab] = useState<"evolve" | "library">("evolve");
+  const [leftTab, setLeftTab] = useState<"evolve" | "library" | "simulate">("evolve");
+  const [scenario, setScenario] = useState<Scenario>(BASE_SCENARIO);
+  const [archs, setArchs] = useState<Architecture[]>([]);
   const [pendingDrop, setPendingDrop] = useState<SysNode | null>(null);
   const [showImport, setShowImport] = useState(false);
   const [loaded, setLoaded] = useState(false);
@@ -47,6 +52,8 @@ function Canvas() {
     try {
       const raw = localStorage.getItem(STORAGE);
       if (raw) setModel(JSON.parse(raw));
+      const ar = localStorage.getItem(STORAGE + ".archs");
+      if (ar) setArchs(JSON.parse(ar));
     } catch {
       /* ignore */
     }
@@ -55,6 +62,9 @@ function Canvas() {
   useEffect(() => {
     if (loaded) localStorage.setItem(STORAGE, JSON.stringify(model));
   }, [model, loaded]);
+  useEffect(() => {
+    if (loaded) localStorage.setItem(STORAGE + ".archs", JSON.stringify(archs));
+  }, [archs, loaded]);
 
   const scope = getGraph(model, path);
   const crumbs = pathNodes(model, path);
@@ -64,7 +74,7 @@ function Canvas() {
   const updateScope = useCallback((fn: (g: Graph) => Graph) => setModel((m) => setGraph(m, path, fn)), [path]);
 
   const { failed, impacted } = useMemo(() => impactOf(scope), [scope]);
-  const sim = useMemo(() => simulate(scope), [scope]);
+  const sim = useMemo(() => simulate(scope, scenario), [scope, scenario]);
   const userNode = scope.nodes.find((n) => n.kind === "user");
   const applyFix = (f: Fix) => updateScope((g) => f.apply(structuredClone(g)));
 
@@ -82,7 +92,7 @@ function Canvas() {
           load: sim.metrics.get(n.id)?.cap === Infinity ? undefined : sim.metrics.get(n.id)?.util,
           status: sim.metrics.get(n.id)?.status,
           rps: sim.metrics.get(n.id)?.rps,
-          state: failed.has(n.id) ? "failed" : impacted.has(n.id) ? "impacted" : undefined,
+          state: failed.has(n.id) || scenario.fail.includes(n.id) ? "failed" : impacted.has(n.id) ? "impacted" : undefined,
         } satisfies CardData,
       }));
       const edges: Edge[] = scope.edges.map((e) => {
@@ -111,7 +121,7 @@ function Canvas() {
     }));
     const edges: Edge[] = d.edges.map((e, i) => ({ id: `d${i}`, source: e.source, target: e.target, label: e.label, animated: true, markerEnd: { type: MarkerType.ArrowClosed } }));
     return { nodes, edges };
-  }, [editable, scope, view, focus, parent, failed, impacted, sim]);
+  }, [editable, scope, view, focus, parent, failed, impacted, sim, scenario]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
@@ -255,7 +265,7 @@ function Canvas() {
         {/* Left */}
         <aside className="flex w-72 shrink-0 flex-col border-r border-border bg-sidebar">
           <div className="flex border-b border-border text-xs">
-            {[["evolve", "Evolve", Wand2], ["library", "Components", Boxes]].map(([k, l, I]) => {
+            {[["evolve", "Evolve", Wand2], ["simulate", "Simulate", FlaskConical], ["library", "Parts", Boxes]].map(([k, l, I]) => {
               const Icon = I as typeof Wand2;
               return (
                 <button key={k as string} onClick={() => setLeftTab(k as "evolve")} className={cn("flex flex-1 items-center justify-center gap-1.5 py-2.5", leftTab === k ? "border-b-2 border-primary text-foreground" : "text-muted-foreground")}>
@@ -265,7 +275,15 @@ function Canvas() {
             })}
           </div>
           <div className="flex-1 overflow-y-auto p-3">
-            {leftTab === "evolve" ? <Evolve applied={model.requirements} onApply={applyReq} disabled={path.length > 0} /> : <Library />}
+            {leftTab === "evolve" ? <Evolve applied={model.requirements} onApply={applyReq} disabled={path.length > 0} /> : leftTab === "simulate" ? (
+              <div className="space-y-6">
+                <div><Label>Scenario</Label><ScenarioPanel graph={scope} scenario={scenario} onChange={setScenario} /></div>
+                <div><Label>Architectures</Label><ArchitecturesPanel archs={archs} current={model.root} scenario={scenario}
+                  onSave={(name) => setArchs((a) => [...a, { id: uid("a"), name, root: structuredClone(model.root) }])}
+                  onLoad={(a) => { setModel((m) => ({ ...m, root: structuredClone(a.root) })); goTo(0); }}
+                  onDelete={(id) => setArchs((a) => a.filter((x) => x.id !== id))} /></div>
+              </div>
+            ) : <Library />}
           </div>
         </aside>
 
