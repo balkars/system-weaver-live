@@ -11,7 +11,7 @@ export type CardData = {
   drillable?: boolean;
   derived?: boolean;
   load?: number;
-  status?: "idle" | "ok" | "hot" | "breaking";
+  status?: "idle" | "ok" | "hot" | "breaking" | "down";
   rps?: number;
 };
 
