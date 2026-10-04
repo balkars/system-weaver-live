@@ -43,27 +43,41 @@ export interface NodeMetrics {
   cpu: number;
   latency: number;
   errors: number;
-  status: "idle" | "ok" | "hot" | "breaking";
+  status: "idle" | "ok" | "hot" | "breaking" | "down";
 }
 
 export interface SimResult {
   users: number;
   rps: number;
+  throughput: number;
   metrics: Map<string, NodeMetrics>;
   p95: number;
   errorRate: number;
+  availability: number;
   cost: number;
+  complexity: number;
   bottlenecks: SysNode[];
 }
 
-export function simulate(g: Graph): SimResult {
-  const byId = new Map(g.nodes.map((n) => [n.id, n]));
-  const flowEdges = g.edges.filter((e) => !isTelemetry(e.pattern) && byId.has(e.source) && byId.has(e.target));
-  const users = g.nodes.filter((n) => n.kind === "user").reduce((s, n) => s + parseUsers(n.fields.Concurrent), 0);
-  const inbound = new Map<string, number>();
-  g.nodes.forEach((n) => inbound.set(n.id, n.kind === "user" ? parseUsers(n.fields.Concurrent) * REQ_PER_USER : 0));
+/** A scenario is an input to the simulation, not a change to the model. */
+export interface Scenario {
+  traffic: number;
+  extraLatency: number;
+  fail: string[];
+}
+export const BASE_SCENARIO: Scenario = { traffic: 1, extraLatency: 0, fail: [] };
 
-  // Kahn topological order (cycles broken by leftover order)
+const dbKindsSim = ["postgres", "mysql", "mongodb"];
+
+export function simulate(g: Graph, sc: Scenario = BASE_SCENARIO): SimResult {
+  const byId = new Map(g.nodes.map((n) => [n.id, n]));
+  const isDown = (id: string) => !!byId.get(id)?.failed || sc.fail.includes(id);
+  const flowEdges = g.edges.filter((e) => !isTelemetry(e.pattern) && byId.has(e.source) && byId.has(e.target));
+  const userLoad = (n: SysNode) => parseUsers(n.fields.Concurrent) * sc.traffic;
+  const users = g.nodes.filter((n) => n.kind === "user").reduce((s, n) => s + userLoad(n), 0);
+  const inbound = new Map<string, number>();
+  g.nodes.forEach((n) => inbound.set(n.id, n.kind === "user" ? userLoad(n) * REQ_PER_USER : 0));
+
   const indeg = new Map(g.nodes.map((n) => [n.id, 0]));
   flowEdges.forEach((e) => indeg.set(e.target, (indeg.get(e.target) ?? 0) + 1));
   const queue = g.nodes.filter((n) => !indeg.get(n.id)).map((n) => n.id);
@@ -81,23 +95,34 @@ export function simulate(g: Graph): SimResult {
   }
   g.nodes.forEach((n) => !seen.has(n.id) && order.push(n.id));
 
-  for (const id of order) {
-    const n = byId.get(id)!;
-    let out = inbound.get(id) ?? 0;
-    if (n.kind === "redis") out *= 1 - CACHE_HIT;
-    if (n.kind === "cdn") out *= 1 - CDN_HIT;
-    const outs = flowEdges.filter((e) => e.source === id);
-    // group by target kind: same-kind targets are replicas sharing the load
+  /** Same-kind targets are replicas; dead replicas are skipped when a healthy peer exists; a dead cache is bypassed. */
+  const groupsOf = (id: string) => {
     const groups = new Map<string, string[]>();
-    outs.forEach((e) => {
+    flowEdges.filter((e) => e.source === id).forEach((e) => {
       const k = byId.get(e.target)!.kind;
       groups.set(k, [...(groups.get(k) ?? []), e.target]);
     });
-    // if a node calls a cache AND a db, the cache absorbs reads first; db traffic flows via cache
+    const live = new Map<string, string[]>();
+    groups.forEach((ts, k) => {
+      const healthy = ts.filter((t) => !isDown(t));
+      live.set(k, healthy.length ? healthy : ts);
+    });
+    const cache = live.get("redis");
+    const hasDb = [...live.keys()].some((k) => dbKindsSim.includes(k));
+    if (cache && cache.every(isDown) && hasDb) live.delete("redis");
+    return live;
+  };
+
+  for (const id of order) {
+    const n = byId.get(id)!;
+    if (isDown(id)) continue;
+    let out = inbound.get(id) ?? 0;
+    if (n.kind === "redis") out *= 1 - CACHE_HIT;
+    if (n.kind === "cdn") out *= 1 - CDN_HIT;
+    const groups = groupsOf(id);
     const hasCache = groups.has("redis");
     groups.forEach((targets, k) => {
-      const isDbGroup = ["postgres", "mysql", "mongodb"].includes(k);
-      const share = hasCache && isDbGroup ? 0 : out / targets.length;
+      const share = hasCache && dbKindsSim.includes(k) ? 0 : out / targets.length;
       targets.forEach((t) => inbound.set(t, (inbound.get(t) ?? 0) + share));
     });
   }
@@ -106,6 +131,11 @@ export function simulate(g: Graph): SimResult {
   let cost = 0;
   g.nodes.forEach((n) => {
     const rps = inbound.get(n.id) ?? 0;
+    if (BASE_CAP[n.kind]) cost += SIZE_COST[sizeOf(n)] * shardsOf(n);
+    if (isDown(n.id)) {
+      metrics.set(n.id, { rps, cap: capacityOf(n), util: 0, cpu: 0, latency: 0, errors: 100, status: "down" });
+      return;
+    }
     const cap = capacityOf(n);
     const util = cap === Infinity ? 0 : rps / cap;
     const base = BASE_LAT[n.kind] ?? 0;
@@ -113,21 +143,38 @@ export function simulate(g: Graph): SimResult {
     const errors = util > 1 ? (1 - 1 / util) * 100 : 0;
     const status = rps === 0 && n.kind !== "user" ? "idle" : util > 1 ? "breaking" : util > 0.75 ? "hot" : "ok";
     metrics.set(n.id, { rps, cap, util, cpu: Math.min(100, util * 100), latency, errors, status });
-    if (BASE_CAP[n.kind]) cost += SIZE_COST[sizeOf(n)] * shardsOf(n);
   });
 
-  // request path latency: longest synchronous path from users
   const lat = new Map<string, number>();
+  const ok = new Map<string, number>();
   for (const id of [...order].reverse()) {
-    const outs = flowEdges.filter((e) => e.source === id && !/async/i.test(e.pattern));
-    const down = outs.length ? Math.max(...outs.map((e) => lat.get(e.target) ?? 0)) : 0;
-    lat.set(id, (metrics.get(id)?.latency ?? 0) + down);
+    const m = metrics.get(id)!;
+    if (isDown(id)) {
+      lat.set(id, 0);
+      ok.set(id, 0);
+      continue;
+    }
+    let down = 0;
+    let succ = 1 - m.errors / 100;
+    groupsOf(id).forEach((targets) => {
+      const sync = targets.filter((t) => flowEdges.some((e) => e.source === id && e.target === t && !/async/i.test(e.pattern)));
+      if (!sync.length) return;
+      down = Math.max(down, ...sync.map((t) => (lat.get(t) ?? 0) + sc.extraLatency));
+      succ *= sync.reduce((s, t) => s + (ok.get(t) ?? 1), 0) / sync.length;
+    });
+    lat.set(id, m.latency + down);
+    ok.set(id, succ);
   }
-  const p95 = Math.max(0, ...g.nodes.filter((n) => n.kind === "user").map((u) => lat.get(u.id) ?? 0)) * 1.6;
-  let pass = 1;
-  metrics.forEach((m) => m.errors > 0 && (pass *= 1 - m.errors / 100));
-  const bottlenecks = g.nodes.filter((n) => metrics.get(n.id)!.status === "breaking").sort((a, b) => metrics.get(b.id)!.util - metrics.get(a.id)!.util);
-  return { users, rps: users * REQ_PER_USER, metrics, p95, errorRate: (1 - pass) * 100, cost, bottlenecks };
+  const userNodes = g.nodes.filter((n) => n.kind === "user");
+  const totalRps = users * REQ_PER_USER;
+  const served = userNodes.reduce((s, u) => s + userLoad(u) * REQ_PER_USER * (ok.get(u.id) ?? 1), 0);
+  const errorRate = totalRps ? (1 - served / totalRps) * 100 : 0;
+  const p95 = Math.max(0, ...userNodes.map((u) => lat.get(u.id) ?? 0)) * 1.6;
+  const bottlenecks = g.nodes
+    .filter((n) => metrics.get(n.id)!.status === "down" || (metrics.get(n.id)!.status === "breaking" && metrics.get(n.id)!.rps > 0))
+    .sort((a, b) => metrics.get(b.id)!.util - metrics.get(a.id)!.util);
+  const complexity = g.nodes.filter((n) => n.kind !== "user").length + g.edges.length * 0.5;
+  return { users, rps: totalRps, throughput: served, metrics, p95, errorRate, availability: 100 - errorRate, cost, complexity, bottlenecks };
 }
 
 /* ---------- Fixes: the senior-engineer ladder ---------- */
@@ -233,5 +280,5 @@ export function fixesFor(g: Graph, n: SysNode): Fix[] {
   return out;
 }
 
-export const statusColor = (s?: NodeMetrics["status"]) => (s === "breaking" ? "var(--destructive)" : s === "hot" ? "var(--warning)" : "var(--primary)");
+export const statusColor = (s?: NodeMetrics["status"]) => (s === "breaking" || s === "down" ? "var(--destructive)" : s === "hot" ? "var(--warning)" : "var(--primary)");
 export const isScalable = (kind: string) => !!BASE_CAP[kind] && catalogOf(kind).category !== "client";
